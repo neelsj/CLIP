@@ -79,6 +79,8 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         model.cuda()
 
+    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+
     # Data loading code
     valdir = os.path.join(args.data, 'val')
 
@@ -99,53 +101,51 @@ def main_worker(gpu, ngpus_per_node, args):
     val_dataset.classes = [labels[i] for i in range(len(val_dataset.classes))]
 
     with torch.no_grad():
-        text_inputs = torch.cat([clip.tokenize(f"a photo of a {c}") for c in val_dataset.classes]).to(device)
+        text_tokens = torch.cat([clip.tokenize(f"a photo of a {c}") for c in val_dataset.classes]).to(device)
 
-    validate(val_loader, model, text_inputs, args)
+    validate(val_loader, model, text_tokens, criterion, args)
     return
 
-def validate(val_loader, model, text_inputs, args):
-
-    def run_validate(loader, text_inputs, base_progress=0):
-        with torch.no_grad():
-            end = time.time()
-            for i, (images, target) in enumerate(loader):
-                i = base_progress + i
-
-                if torch.cuda.is_available():
-                    images = images.cuda(args.gpu, non_blocking=True)
-                    target = target.cuda(args.gpu, non_blocking=True)
-
-                # compute output
-                image_features = model.encode_image(images)
-                image_features /= image_features.norm(dim=-1, keepdim=True)
-
-                output,_ = model(images, text_inputs)
-
-                # measure accuracy and record loss
-                acc1, acc5 = accuracy(output, target, topk=(1, 5))
-                top1.update(acc1[0], images.size(0))
-                top5.update(acc5[0], images.size(0))
-
-                # measure elapsed time
-                batch_time.update(time.time() - end)
-                end = time.time()
-
-                if i % args.print_freq == 0:
-                    progress.display(i + 1)
+def validate(val_loader, model, text_tokens, criterion, args):
 
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
+    losses = AverageMeter('Loss', ':.4e', Summary.NONE)
     top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
     top5 = AverageMeter('Acc@5', ':6.2f', Summary.AVERAGE)
     progress = ProgressMeter(
         len(val_loader),
-        [batch_time, top1, top5],
+        [batch_time, losses, top1, top5],
         prefix='Test: ')
 
     # switch to evaluate mode
     model.eval()
 
-    run_validate(val_loader, text_inputs)
+    base_progress = 0
+    with torch.no_grad():
+        end = time.time()
+        for i, (images, target) in enumerate(val_loader):
+            i = base_progress + i
+
+            if torch.cuda.is_available():
+                images = images.cuda(args.gpu, non_blocking=True)
+                target = target.cuda(args.gpu, non_blocking=True)
+
+            # compute output
+            output = model(images, text_tokens)
+            loss = criterion(output, target)
+
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                progress.display(i + 1)
 
     progress.display_summary()
 
