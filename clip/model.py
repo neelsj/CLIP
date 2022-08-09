@@ -286,6 +286,12 @@ class CLIP(nn.Module):
             attn_mask=self.build_attention_mask()
         )
 
+        self.image_text = nn.Sequential(OrderedDict([
+            ("linear1", nn.Linear(1024, 512)),
+            ("relu", nn.ReLU(inplace=True)),
+            ("linear2", nn.Linear(512, 512))
+        ]))
+
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
@@ -336,6 +342,9 @@ class CLIP(nn.Module):
     @property
     def dtype(self):
         return self.visual.conv1.weight.dtype
+
+    def transform_image_text(self, image_feature, text_feature):
+        return self.image_text(torch.cat((image_feature, text_feature),-1))
 
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
@@ -432,5 +441,10 @@ def build_model(state_dict: dict):
             del state_dict[key]
 
     convert_weights(model)
-    model.load_state_dict(state_dict)
+
+    try:
+        model.load_state_dict(state_dict)
+    except:
+        pass
+
     return model.eval()
