@@ -253,7 +253,8 @@ class CLIP(nn.Module):
                  vocab_size: int,
                  transformer_width: int,
                  transformer_heads: int,
-                 transformer_layers: int
+                 transformer_layers: int, 
+                 mode: str, classes: int
                  ):
         super().__init__()
 
@@ -286,11 +287,19 @@ class CLIP(nn.Module):
             attn_mask=self.build_attention_mask()
         )
 
-        self.image_text = nn.Sequential(OrderedDict([
-            ("linear1", nn.Linear(1024, 512)),
-            ("relu", nn.ReLU(inplace=True)),
-            ("linear2", nn.Linear(512, 512))
-        ]))
+        print(mode)
+        self.mode = mode
+        self.classes = classes
+
+        if (self.mode == 'lin'):
+            self.lin = nn.Linear(embed_dim, self.classes)
+
+        elif (self.mode == 'context'):
+            self.image_text = nn.Sequential(OrderedDict([
+                ("linear1", nn.Linear(2*embed_dim, embed_dim)),
+                ("relu", nn.ReLU(inplace=True)),
+                ("linear2", nn.Linear(embed_dim, embed_dim))
+            ]))
 
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
@@ -343,8 +352,19 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def transform_image_text(self, image_feature, text_feature):
-        return self.image_text(torch.cat((image_feature, text_feature),-1))
+    def transform_image_text(self, image_features, text_features):
+
+        image_features = image_features.expand(text_features.shape[0], -1, -1)
+        image_features = torch.permute(image_features, (1,0, 2))
+
+        text_features = text_features.expand(image_features.shape[0], -1, -1)
+        image_text_features = torch.cat((image_features, text_features),-1)
+        image_text_features = torch.reshape(image_text_features,(image_text_features.shape[0]*image_text_features.shape[1], image_text_features.shape[2]))
+
+        image_text_features_trans =  self.image_text(image_text_features)
+        image_text_features_trans = torch.reshape(image_text_features_trans,(image_features.shape[0], image_features.shape[1], image_features.shape[2]))
+
+        return image_text_features_trans
 
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
@@ -364,19 +384,36 @@ class CLIP(nn.Module):
 
         return x
 
-    def forward(self, image, text):
+    def forward(self, image, text_tokens):
+
+        #print("Forward")
+
         image_features = self.encode_image(image)
-        text_features = self.encode_text(text)
+        text_features = self.encode_text(text_tokens)
 
         # normalized features
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=1, keepdim=True)
 
-        # cosine similarity as logits
-        logit_scale = self.logit_scale.exp()
-        logits_per_image = logit_scale * image_features @ text_features.t()
+        if (self.mode == 'lin'):
+            logits_per_image = self.lin(image_features)
 
-        # shape = [global_batch_size, classes]
+        elif (self.mode == 'context'):
+            image_text_features_trans = self.transform_image_text(image_features, text_features)
+            image_text_features_trans = image_text_features_trans / image_text_features_trans.norm(dim=2, keepdim=True)
+            image_text_features_trans = torch.permute(image_text_features_trans, (0, 2, 1))
+
+            image_features = torch.unsqueeze(image_features, 1)
+            logit_scale = self.logit_scale.exp()
+            logits_per_image = logit_scale * torch.squeeze(torch.bmm(image_features, image_text_features_trans))
+        else:
+            # normalized features
+            text_features = text_features / text_features.norm(dim=1, keepdim=True)
+
+            # cosine similarity as logits
+            logit_scale = self.logit_scale.exp()
+            logits_per_image = logit_scale * image_features @ text_features.t()
+
+        ## shape = [global_batch_size, classes]
         return logits_per_image
 
 
@@ -404,7 +441,7 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict):
+def build_model(state_dict: dict, mode, classes):
     vit = "visual.proj" in state_dict
 
     if vit:
@@ -432,7 +469,8 @@ def build_model(state_dict: dict):
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
-        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
+        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, 
+        mode, classes
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:

@@ -43,7 +43,7 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+parser.add_argument('--lr', '--learning-rate', default=1e-4, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
@@ -73,6 +73,9 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+
+parser.add_argument('--mode', default='lin', choices=['lin', 'context'])
+parser.add_argument('--classes', default=1000, type=int)
 
 best_acc1 = 0
 
@@ -128,9 +131,10 @@ def main_worker(gpu, ngpus_per_node, args):
             args.rank = args.rank * ngpus_per_node + gpu
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
+
     # create model
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, preprocess = clip.load(args.arch, device)
+    model, preprocess = clip.load(args.arch, device, mode=args.mode, classes=args.classes)
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -166,7 +170,31 @@ def main_worker(gpu, ngpus_per_node, args):
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+    for param in model.parameters():
+        param.requires_grad = False
+
+    if (args.mode == 'lin'):
+        if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)):
+            for param in model.module.lin.parameters():
+                param.requires_grad = True 
+        else:
+            for param in model.lin.parameters():
+                param.requires_grad = True 
+
+    elif (args.mode == 'context'):
+        if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)):
+            for param in model.module.image_text.parameters():
+                param.requires_grad = True 
+        else:
+            for param in model.image_text.parameters():
+                param.requires_grad = True 
+
+    params = list(filter(lambda p: p.requires_grad, model.parameters()))
+    num_var = sum(p.numel() for p in params)
+
+    print('Training %d variables' % num_var)
+
+    optimizer = torch.optim.SGD(params, args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
     
@@ -201,6 +229,9 @@ def main_worker(gpu, ngpus_per_node, args):
     # Data loading code
     traindir = os.path.join(args.data, 'train')
     valdir = os.path.join(args.data, 'val')
+    val_dataset = datasets.ImageFolder(
+        valdir,
+        preprocess)
 
     train_dataset = datasets.ImageFolder(
         traindir,
@@ -212,9 +243,7 @@ def main_worker(gpu, ngpus_per_node, args):
             preprocess,
         ]))
 
-    val_dataset = datasets.ImageFolder(
-        valdir,
-        preprocess)
+
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -295,8 +324,11 @@ def train(train_loader, model, text_tokens, criterion, optimizer, epoch, args):
             images = images.cuda(args.gpu, non_blocking=True)
             target = target.cuda(args.gpu, non_blocking=True)
 
+        #print(target.min().data.cpu(), target.max().data.cpu()) 
+
         # compute output
         output = model(images, text_tokens)
+
         loss = criterion(output, target)
 
         # measure accuracy and record loss
