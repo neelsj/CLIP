@@ -301,6 +301,9 @@ class CLIP(nn.Module):
                 ("linear2", nn.Linear(embed_dim, embed_dim))
             ]))
 
+        elif (self.mode == 'lin_t'):
+            self.image_text = nn.Linear(embed_dim, embed_dim)
+
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
@@ -405,6 +408,14 @@ class CLIP(nn.Module):
             image_features = torch.unsqueeze(image_features, 1)
             logit_scale = self.logit_scale.exp()
             logits_per_image = logit_scale * torch.squeeze(torch.bmm(image_features, image_text_features_trans))
+        elif (self.mode == 'lin_t'):
+            text_features_trans = self.image_text(text_features)
+
+            text_features_trans = text_features_trans / text_features_trans.norm(dim=1, keepdim=True)
+
+            # cosine similarity as logits
+            logit_scale = self.logit_scale.exp()
+            logits_per_image = logit_scale * image_features @ text_features_trans.t()
         else:
             # normalized features
             text_features = text_features / text_features.norm(dim=1, keepdim=True)

@@ -1,0 +1,1 @@
+{"project_name": "clip_context", "storage_account_name": "objectnet", "container_name": "amulet", "blob_storage_account_name": "objectnet", "registry_name": "projects", "local_path": "/mnt/cvgroupeast/Source/CLIP", "default_output_dir": "/mnt/cvgroupeast/Source/CLIP/amlt", "project_uuid": "7339772945.88369-7fd08ab8-4aba-49a2-b328-bb4c178ba7df", "version": "9.8.4"}

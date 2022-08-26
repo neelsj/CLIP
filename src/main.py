@@ -23,6 +23,7 @@ from torch.utils.data import Subset
 
 import clip
 import json
+import os
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR', default='imagenet',
@@ -32,8 +33,8 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='ViT-B/32',
                     help='model architecture: ' +
                         ' | '.join(clip.available_models()) +
                         ' (default: ViT-B/32)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
-                    help='number of data loading workers (default: 4)')
+parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
+                    help='number of data loading workers (default: 32)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
@@ -74,7 +75,7 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 
-parser.add_argument('--mode', default='lin', choices=['lin', 'context'])
+parser.add_argument('--mode', default='clip', choices=['clip', 'lin', 'context', 'lin_t'])
 parser.add_argument('--classes', default=1000, type=int)
 
 best_acc1 = 0
@@ -82,6 +83,9 @@ best_acc1 = 0
 
 def main():
     args = parser.parse_args()
+
+    if "AMLT_OUTPUT_DIR" in os.environ:
+        print('output dir %s' % os.environ["AMLT_OUTPUT_DIR"])
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -170,6 +174,54 @@ def main_worker(gpu, ngpus_per_node, args):
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
+    cudnn.benchmark = True
+
+    # Data loading code
+    traindir = os.path.join(args.data, 'train')
+    valdir = os.path.join(args.data, 'sketch')
+    val_dataset = datasets.ImageFolder(
+        valdir,
+        preprocess)
+
+    train_dataset = datasets.ImageFolder(
+        traindir,
+        transforms.Compose([
+            transforms.RandomResizedCrop(model.module.visual.input_resolution 
+                                         if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)) else
+                                         model.visual.input_resolution),
+            transforms.RandomHorizontalFlip(),
+            preprocess,
+        ]))
+
+
+
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=True)
+    else:
+        train_sampler = None
+        val_sampler = None
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True, sampler=val_sampler)
+
+    with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "imagenet-simple-labels.json")) as f:
+        labels = json.load(f)
+
+    val_dataset.classes = [labels[i] for i in range(len(val_dataset.classes))]
+
+    with torch.no_grad():
+        text_tokens = torch.cat([clip.tokenize(f"a photo of a {c}") for c in val_dataset.classes]).to(device)
+
+    if args.evaluate:
+        validate(val_loader, model, text_tokens, criterion, args)
+        return
+
     for param in model.parameters():
         param.requires_grad = False
 
@@ -182,6 +234,14 @@ def main_worker(gpu, ngpus_per_node, args):
                 param.requires_grad = True 
 
     elif (args.mode == 'context'):
+        if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)):
+            for param in model.module.image_text.parameters():
+                param.requires_grad = True 
+        else:
+            for param in model.image_text.parameters():
+                param.requires_grad = True 
+
+    elif (args.mode == 'lin_t'):
         if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)):
             for param in model.module.image_text.parameters():
                 param.requires_grad = True 
@@ -216,6 +276,9 @@ def main_worker(gpu, ngpus_per_node, args):
             if args.gpu is not None:
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
+
+            #print(checkpoint['state_dict'])
+
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['scheduler'])
@@ -224,53 +287,6 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
-    cudnn.benchmark = True
-
-    # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
-    val_dataset = datasets.ImageFolder(
-        valdir,
-        preprocess)
-
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(model.module.visual.input_resolution 
-                                         if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)) else
-                                         model.visual.input_resolution),
-            transforms.RandomHorizontalFlip(),
-            preprocess,
-        ]))
-
-
-
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=True)
-    else:
-        train_sampler = None
-        val_sampler = None
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True, sampler=val_sampler)
-
-    with open("imagenet-simple-labels.json") as f:
-        labels = json.load(f)
-
-    val_dataset.classes = [labels[i] for i in range(len(val_dataset.classes))]
-
-    with torch.no_grad():
-        text_tokens = torch.cat([clip.tokenize(f"a photo of a {c}") for c in val_dataset.classes]).to(device)
-
-    if args.evaluate:
-        validate(val_loader, model, text_tokens, criterion, args)
-        return
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -395,6 +411,12 @@ def validate(val_loader, model, text_tokens, criterion, args):
     return top1.avg
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+
+    if "AMLT_OUTPUT_DIR" in os.environ:
+        filename = os.path.join(os.environ["AMLT_OUTPUT_DIR"], filename)
+
+    print('saving ' + filename)
+
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')

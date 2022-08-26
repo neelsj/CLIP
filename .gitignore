@@ -10,3 +10,7 @@ thumbs.db
 .idea
 /.vs
 *.tar
+/src/.vs
+/src/clip/.vs
+/amlt_docker_images.txt
+/log.txt

@@ -1,0 +1,34 @@
+description: CLIP_lin_t
+
+target:
+  service: sing
+  name: msrresrchvc
+
+environment:
+  image: amlt-sing/pytorch-1.11.0
+  
+  setup:
+  - pip install -r src/requirements.txt
+
+code:
+  local_dir: $CONFIG_DIR/
+
+storage:
+  objectnet:
+    storage_account_name: objectnet
+    container_name: phillytools  
+
+jobs:
+- name: clip_lin_t_lr_1e-2
+  sku: 16G1-V100
+  sla_tier: Basic
+  command:
+  - python src/main.py /mnt/objectnet/data/ILSVRC2012 --lr 1e-2 --mode lin_t --b 1024
+
+- name: clip_context_lr_1e-2
+  sku: 16G1-V100
+  sla_tier: Basic
+  command:
+  - python src/main.py /mnt/objectnet/data/ILSVRC2012 --lr 1e-2 --mode context --b 1024
+
+  
