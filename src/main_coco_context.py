@@ -25,8 +25,81 @@ import clip
 import json
 import os
 
+from typing import Any, Callable, Optional, Tuple, List
+from PIL import Image
+
+from pycocotools.coco import COCO
+
+class CocoDetectionCaption(datasets.VisionDataset):
+    def __init__(
+        self,
+        root: str,
+        annFile: str,
+        annCapFile: str,
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        transforms: Optional[Callable] = None,
+    ) -> None:
+        super().__init__(root, transforms, transform, target_transform)
+
+        self.coco = COCO(annFile)
+        self.cocoCap = COCO(annCapFile)
+        self.ids = list(sorted(self.coco.imgs.keys()))
+
+        self.coco_id_to_ind = {}
+        for i, cat in enumerate(self.coco.cats):
+            self.coco_id_to_ind[cat] = i
+
+    def _load_image(self, id: int) -> Image.Image:
+        path = self.coco.loadImgs(id)[0]["file_name"]
+        return Image.open(os.path.join(self.root, path)).convert("RGB")
+
+    def _load_target(self, id: int) -> List[Any]:
+        anns = self.coco.loadAnns(self.coco.getAnnIds(id))
+        annsCap = self.cocoCap.loadAnns(self.cocoCap.getAnnIds(id))
+
+        categories = [ann["category_id"] for ann in anns]
+        categories = sorted(list(set(categories)))
+        random.shuffle(categories)
+
+        categories_text = [self.coco.cats[category_id]["name"] for category_id in categories]
+        
+        #print(categories_text)
+
+        classes_prompt = f"A photo of a %s" % categories_text[0]
+        
+        if (len(categories_text) > 0):
+            classes_prompt = classes_prompt + "".join([f", {c}" for c in categories_text[1:-1]])
+
+        classes_prompt = classes_prompt + f", and a %s." % categories_text[-1]
+
+        captions = [ann["caption"] for ann in annsCap]
+
+        caption = random.choice(captions)
+
+        #print(classes_prompt)
+        #print(caption)
+        
+        classes_prompt_tokens = torch.squeeze(clip.tokenize(classes_prompt))
+        caption_tokens = torch.squeeze(clip.tokenize(caption))
+        
+        return classes_prompt_tokens, caption_tokens
+
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        id = self.ids[index]
+        image = self._load_image(id)
+        classes_prompt_tokens, caption_tokens = self._load_target(id)
+
+        if self.transforms is not None:
+            image, _ = self.transforms(image, None)
+
+        return image, classes_prompt_tokens, caption_tokens
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR', default='imagenet',
+parser.add_argument('data', metavar='DIR', default='coco',
                     help='path to dataset (default: imagenet)')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='ViT-B/32',
                     choices=clip.available_models(),
@@ -172,84 +245,64 @@ def main_worker(gpu, ngpus_per_node, args):
             model = torch.nn.DataParallel(model).cuda()
 
     # define loss function (criterion), optimizer, and learning rate scheduler
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    criterion = nn.CosineSimilarity().cuda(args.gpu)
 
     cudnn.benchmark = True
 
     # Data loading code
-    if not args.evaluate:
-        traindir = os.path.join(args.data, 'train')
+    traindir = os.path.join(args.data, 'train2017')
+    valdir = os.path.join(args.data, 'val2017')
 
-        train_dataset = datasets.ImageFolder(
-            traindir,
-            transforms.Compose([
-                transforms.RandomResizedCrop(model.module.visual.input_resolution 
-                                             if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)) else
-                                             model.visual.input_resolution),
-                transforms.RandomHorizontalFlip(),
-                preprocess,
-            ]))
+    trainjson = os.path.join(args.data, 'annotations/instances_train2017.json')
+    traincapjson = os.path.join(args.data, 'annotations/captions_train2017.json')
+    valjson = os.path.join(args.data, 'annotations/instances_val2017.json')
+    valcapjson = os.path.join(args.data, 'annotations/captions_val2017.json')
 
-        if args.distributed:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-        else:
-            train_sampler = None
+    train_dataset = CocoDetectionCaption(
+        traindir,
+        trainjson,
+        traincapjson,
+        transforms.Compose([
+            transforms.RandomResizedCrop(model.module.visual.input_resolution 
+                                         if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)) else
+                                         model.visual.input_resolution),
+            transforms.RandomHorizontalFlip(),
+            preprocess,
+        ]))
 
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-            num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
-    valdir = os.path.join(args.data, 'val')
-    val_dataset = datasets.ImageFolder(
+    val_dataset = CocoDetectionCaption(
         valdir,
+        valjson,
+        valcapjson,
         preprocess)
 
     if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=True)
     else:
+        train_sampler = None
         val_sampler = None
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
-    with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "imagenet-simple-labels.json")) as f:
-        labels = json.load(f)
-
-    val_dataset.classes = [labels[i] for i in range(len(val_dataset.classes))]
-
-    with torch.no_grad():
-        text_tokens = torch.cat([clip.tokenize(f"a photo of a {c}") for c in val_dataset.classes]).to(device)
-
     if args.evaluate:
-        validate(val_loader, model, text_tokens, criterion, args)
+        validate(val_loader, model, criterion, args)
         return
 
     for param in model.parameters():
         param.requires_grad = False
 
-    if (args.mode == 'lin'):
-        if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)):
-            for param in model.module.lin.parameters():
-                param.requires_grad = True 
-        else:
-            for param in model.lin.parameters():
-                param.requires_grad = True 
-
-    elif (args.mode == 'context'):
-        if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)):
-            for param in model.module.image_text.parameters():
-                param.requires_grad = True 
-        else:
-            for param in model.image_text.parameters():
-                param.requires_grad = True 
-
-    elif (args.mode == 'lin_t'):
-        if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)):
-            for param in model.module.image_text.parameters():
-                param.requires_grad = True 
-        else:
-            for param in model.image_text.parameters():
+    if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)):
+        for param in model.module.image_text.parameters():
+            param.requires_grad = True 
+    else:
+        for param in model.image_text.parameters():
                 param.requires_grad = True 
 
     params = list(filter(lambda p: p.requires_grad, model.parameters()))
@@ -296,10 +349,10 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, text_tokens, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, text_tokens, criterion, args)
+        acc1 = validate(val_loader, model, criterion, args)
         
         scheduler.step()
 
@@ -320,7 +373,7 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best)
 
 
-def train(train_loader, model, text_tokens, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -348,13 +401,16 @@ def train(train_loader, model, text_tokens, criterion, optimizer, epoch, args):
         # compute output
         output = model(images, text_tokens)
 
+        print(output)
+        print(target)
+
         loss = criterion(output, target)
 
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        # measure accuracy_multilabel and record loss
+        acc1, acc5 = accuracy_multilabel(output, target, threshs=(.2, .5))
         losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+        top1.update(acc1, images.size(0))
+        top5.update(acc5, images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -368,15 +424,15 @@ def train(train_loader, model, text_tokens, criterion, optimizer, epoch, args):
         if i % args.print_freq == 0:
             progress.display(i + 1)
 
-def validate(val_loader, model, text_tokens, criterion, args):
+def validate(val_loader, model, criterion, args):
 
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
-    losses = AverageMeter('Loss', ':.4e', Summary.NONE)
-    top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
-    top5 = AverageMeter('Acc@5', ':6.2f', Summary.AVERAGE)
+    losses1 = AverageMeter('Loss 1', ':.4e', Summary.NONE)
+    losses2 = AverageMeter('Loss 2', ':.4e', Summary.NONE)
+    losses3 = AverageMeter('Loss 3', ':.4e', Summary.NONE)
     progress = ProgressMeter(
         len(val_loader),
-        [batch_time, losses, top1, top5],
+        [batch_time, losses1, losses2, losses3],
         prefix='Test: ')
 
     # switch to evaluate mode
@@ -385,25 +441,26 @@ def validate(val_loader, model, text_tokens, criterion, args):
     base_progress = 0
     with torch.no_grad():
         end = time.time()
-        for i, (images, target) in enumerate(val_loader):
+        for i, (images, classes_prompt_tokens, caption_tokens) in enumerate(val_loader):               
+
             i = base_progress + i
 
             if torch.cuda.is_available():
                 images = images.cuda(args.gpu, non_blocking=True)
-                target = target.cuda(args.gpu, non_blocking=True)
+                classes_prompt_tokens = classes_prompt_tokens.cuda(args.gpu, non_blocking=True)
+                caption_tokens = caption_tokens.cuda(args.gpu, non_blocking=True)
 
             # compute output
-            output = model(images, text_tokens)
-            loss = criterion(output, target)
+            image_features, classes_prompt_features, caption_features = model(images, classes_prompt_tokens, caption_tokens)
 
-            #print(target)
-            #print(output)
+            loss1 = 1-criterion(image_features, classes_prompt_features)
+            loss2 = 1-criterion(classes_prompt_features, caption_features)
+            loss3 = 1-criterion(image_features, caption_features)
 
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images.size(0))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
+            # measure accuracy_multilabel and record loss
+            losses1.update(loss1.item(), images.size(0))
+            losses2.update(loss2.item(), images.size(0))
+            losses3.update(loss3.item(), images.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -515,6 +572,26 @@ def accuracy(output, target, topk=(1,)):
             correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
+
+def accuracy_multilabel(output, target, threshs=(.5,.9)):
+    with torch.no_grad():
+        outputs = torch.sigmoid(output)
+
+        accs = []
+
+        for thresh in threshs:
+            outputb = torch.ge(outputs, thresh)
+            targetb = target.bool()
+
+            tp = torch.sum(torch.bitwise_and(outputb, targetb).int()).cpu().detach().numpy()            
+            #tn = torch.sum(torch.logical_not(torch.bitwise_or(outputb, targetb)).int()).cpu().detach().numpy()
+
+            total = targetb.size(1)
+
+            acc = tp/total
+            accs.append(acc)
+
+        return accs
 
 
 if __name__ == '__main__':

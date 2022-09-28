@@ -25,8 +25,61 @@ import clip
 import json
 import os
 
+from typing import Any, Callable, Optional, Tuple, List
+from PIL import Image
+
+from pycocotools.coco import COCO
+
+class CocoDetectionCaption(datasets.VisionDataset):
+    def __init__(
+        self,
+        root: str,
+        annFile: str,
+        annCapFile: str,
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        transforms: Optional[Callable] = None,
+    ) -> None:
+        super().__init__(root, transforms, transform, target_transform)
+
+        self.coco = COCO(annFile)
+        self.cocoCap = COCO(annCapFile)
+        self.ids = list(sorted(self.coco.imgs.keys()))
+
+        self.coco_id_to_ind = {}
+        for i, cat in enumerate(self.coco.cats):
+            self.coco_id_to_ind[cat] = i
+
+    def _load_image(self, id: int) -> Image.Image:
+        path = self.coco.loadImgs(id)[0]["file_name"]
+        return Image.open(os.path.join(self.root, path)).convert("RGB")
+
+    def _load_target(self, id: int) -> List[Any]:
+        anns = self.coco.loadAnns(self.coco.getAnnIds(id))
+
+        categories = [ann["category_id"] for ann in anns]
+        categories = sorted(list(set(categories)))
+
+        categories_ind = torch.FloatTensor(sorted(list(set([self.coco_id_to_ind[cat] for cat in categories]))))
+        target = torch.histc(categories_ind, bins=len(self.coco.cats), min=0, max=len(self.coco.cats)-1)
+
+        return target
+
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        id = self.ids[index]
+        image = self._load_image(id)
+        target = self._load_target(id)
+
+        if self.transforms is not None:
+            image, target = self.transforms(image, target)
+
+        return image, target
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR', default='imagenet',
+parser.add_argument('data', metavar='DIR', default='coco',
                     help='path to dataset (default: imagenet)')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='ViT-B/32',
                     choices=clip.available_models(),
@@ -172,54 +225,58 @@ def main_worker(gpu, ngpus_per_node, args):
             model = torch.nn.DataParallel(model).cuda()
 
     # define loss function (criterion), optimizer, and learning rate scheduler
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    criterion = nn.MultiLabelSoftMarginLoss().cuda(args.gpu)
 
     cudnn.benchmark = True
 
     # Data loading code
-    if not args.evaluate:
-        traindir = os.path.join(args.data, 'train')
+    traindir = os.path.join(args.data, 'train2017')
+    valdir = os.path.join(args.data, 'val2017')
 
-        train_dataset = datasets.ImageFolder(
-            traindir,
-            transforms.Compose([
-                transforms.RandomResizedCrop(model.module.visual.input_resolution 
-                                             if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)) else
-                                             model.visual.input_resolution),
-                transforms.RandomHorizontalFlip(),
-                preprocess,
-            ]))
+    trainjson = os.path.join(args.data, 'annotations/instances_train2017.json')
+    traincapjson = os.path.join(args.data, 'annotations/captions_train2017.json')
+    valjson = os.path.join(args.data, 'annotations/instances_val2017.json')
+    valcapjson = os.path.join(args.data, 'annotations/captions_val2017.json')
 
-        if args.distributed:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-        else:
-            train_sampler = None
+    train_dataset = CocoDetectionCaption(
+        traindir,
+        trainjson,
+        traincapjson,
+        transforms.Compose([
+            transforms.RandomResizedCrop(model.module.visual.input_resolution 
+                                         if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)) else
+                                         model.visual.input_resolution),
+            transforms.RandomHorizontalFlip(),
+            preprocess,
+        ]))
 
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-            num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
-    valdir = os.path.join(args.data, 'val')
-    val_dataset = datasets.ImageFolder(
+    val_dataset = CocoDetectionCaption(
         valdir,
+        valjson,
+        valcapjson,
         preprocess)
 
     if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=True)
     else:
+        train_sampler = None
         val_sampler = None
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
-    with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "imagenet-simple-labels.json")) as f:
-        labels = json.load(f)
-
-    val_dataset.classes = [labels[i] for i in range(len(val_dataset.classes))]
+    classes = [train_dataset.coco.cats[key]["name"] for key in train_dataset.coco.cats.keys()]
+    classes_prompts = [f"a photo of a {c}" for c in classes]
+    print(classes_prompts)
 
     with torch.no_grad():
-        text_tokens = torch.cat([clip.tokenize(f"a photo of a {c}") for c in val_dataset.classes]).to(device)
+        text_tokens = torch.cat([clip.tokenize(p) for p in classes_prompts]).to(device)
 
     if args.evaluate:
         validate(val_loader, model, text_tokens, criterion, args)
@@ -228,28 +285,11 @@ def main_worker(gpu, ngpus_per_node, args):
     for param in model.parameters():
         param.requires_grad = False
 
-    if (args.mode == 'lin'):
-        if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)):
-            for param in model.module.lin.parameters():
-                param.requires_grad = True 
-        else:
-            for param in model.lin.parameters():
-                param.requires_grad = True 
-
-    elif (args.mode == 'context'):
-        if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)):
-            for param in model.module.image_text.parameters():
-                param.requires_grad = True 
-        else:
-            for param in model.image_text.parameters():
-                param.requires_grad = True 
-
-    elif (args.mode == 'lin_t'):
-        if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)):
-            for param in model.module.image_text.parameters():
-                param.requires_grad = True 
-        else:
-            for param in model.image_text.parameters():
+    if (isinstance(model, nn.DataParallel) or isinstance(model, nn.parallel.DistributedDataParallel)):
+        for param in model.module.image_text.parameters():
+            param.requires_grad = True 
+    else:
+        for param in model.image_text.parameters():
                 param.requires_grad = True 
 
     params = list(filter(lambda p: p.requires_grad, model.parameters()))
@@ -348,13 +388,16 @@ def train(train_loader, model, text_tokens, criterion, optimizer, epoch, args):
         # compute output
         output = model(images, text_tokens)
 
+        print(output)
+        print(target)
+
         loss = criterion(output, target)
 
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        # measure accuracy_multilabel and record loss
+        acc1, acc5 = accuracy_multilabel(output, target, threshs=(.2, .5))
         losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+        top1.update(acc1, images.size(0))
+        top5.update(acc5, images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -386,24 +429,28 @@ def validate(val_loader, model, text_tokens, criterion, args):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
+
             i = base_progress + i
 
             if torch.cuda.is_available():
                 images = images.cuda(args.gpu, non_blocking=True)
                 target = target.cuda(args.gpu, non_blocking=True)
 
+            print(text_tokens.shape)
+
             # compute output
             output = model(images, text_tokens)
-            loss = criterion(output, target)
 
             #print(target)
             #print(output)
 
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            loss = criterion(output, target)
+
+            # measure accuracy_multilabel and record loss
+            acc1, acc5 = accuracy_multilabel(output, target, threshs=(.2, .5))
             losses.update(loss.item(), images.size(0))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
+            top1.update(acc1, images.size(0))
+            top5.update(acc5, images.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -515,6 +562,29 @@ def accuracy(output, target, topk=(1,)):
             correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
+
+def accuracy_multilabel(output, target, threshs=(.5,.9)):
+    with torch.no_grad():
+        outputs = torch.sigmoid(output)
+
+        #print(outputs)
+        #print(target)
+        
+        accs = []
+
+        for thresh in threshs:
+            outputb = torch.ge(outputs, thresh)
+            targetb = target.bool()
+
+            tp = torch.sum(torch.bitwise_and(outputb, targetb).int()).cpu().detach().numpy()            
+            #tn = torch.sum(torch.logical_not(torch.bitwise_or(outputb, targetb)).int()).cpu().detach().numpy()
+
+            total = targetb.size(1)
+
+            acc = tp/total
+            accs.append(acc)
+
+        return accs
 
 
 if __name__ == '__main__':

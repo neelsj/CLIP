@@ -1,1 +1,1 @@
-from .clip import *
+from .clip_caption import *

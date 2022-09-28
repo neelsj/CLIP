@@ -287,22 +287,14 @@ class CLIP(nn.Module):
             attn_mask=self.build_attention_mask()
         )
 
-        print(mode)
         self.mode = mode
         self.classes = classes
 
-        if (self.mode == 'lin'):
-            self.lin = nn.Linear(embed_dim, self.classes)
-
-        elif (self.mode == 'context'):
-            self.image_text = nn.Sequential(OrderedDict([
-                ("linear1", nn.Linear(2*embed_dim, embed_dim)),
-                ("relu", nn.ReLU(inplace=True)),
-                ("linear2", nn.Linear(embed_dim, embed_dim))
-            ]))
-
-        elif (self.mode == 'lin_t'):
-            self.image_text = nn.Linear(embed_dim, embed_dim)
+        self.image_text = nn.Sequential(OrderedDict([
+            ("linear1", nn.Linear(2*embed_dim, embed_dim)),
+            ("relu", nn.ReLU(inplace=True)),
+            ("linear2", nn.Linear(embed_dim, embed_dim))
+        ]))
 
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
@@ -355,20 +347,6 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def transform_image_text(self, image_features, text_features):
-
-        image_features = image_features.expand(text_features.shape[0], -1, -1)
-        image_features = torch.permute(image_features, (1,0, 2))
-
-        text_features = text_features.expand(image_features.shape[0], -1, -1)
-        image_text_features = torch.cat((image_features, text_features),-1)
-        image_text_features = torch.reshape(image_text_features,(image_text_features.shape[0]*image_text_features.shape[1], image_text_features.shape[2]))
-
-        image_text_features_trans =  self.image_text(image_text_features)
-        image_text_features_trans = torch.reshape(image_text_features_trans,(image_features.shape[0], image_features.shape[1], image_features.shape[2]))
-
-        return image_text_features_trans
-
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
 
@@ -387,47 +365,25 @@ class CLIP(nn.Module):
 
         return x
 
-    def forward(self, image, text_tokens):
-
-        #print("Forward %s" % self.mode)
+    def forward(self, image, classes_prompt_tokens, caption_tokens):
 
         image_features = self.encode_image(image)
-        text_features = self.encode_text(text_tokens)
+        classes_prompt_features = self.encode_text(classes_prompt_tokens)
+        caption_features = self.encode_text(caption_tokens)
 
-        # normalized features
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        classes_prompt_features = classes_prompt_features / classes_prompt_features.norm(dim=1, keepdim=True)
+        caption_features = caption_features / caption_features.norm(dim=1, keepdim=True)
 
-        if (self.mode == 'lin'):
-            logits_per_image = self.lin(image_features)
+        #print(image_features.shape)
+        #print(classes_prompt_features.shape)
+        #print(caption_features.shape)
 
-        elif (self.mode == 'context'):
-            image_text_features_trans = self.transform_image_text(image_features, text_features)
-            image_text_features_trans = image_text_features_trans / image_text_features_trans.norm(dim=2, keepdim=True)
-            image_text_features_trans = torch.permute(image_text_features_trans, (0, 2, 1))
+        #image_text_features = torch.cat((image_features, text_features),-1)        
+        #image_text_features_trans = self.image_text(image_text_features)        
+        #image_text_features_trans = image_text_features_trans / image_text_features_trans.norm(dim=1, keepdim=True)            
 
-            image_features = torch.unsqueeze(image_features, 1)
-            logit_scale = self.logit_scale.exp()
-            logits_per_image = logit_scale * torch.squeeze(torch.bmm(image_features, image_text_features_trans))
-
-        elif (self.mode == 'lin_t'):
-            text_features_trans = self.image_text(text_features)
-
-            text_features_trans = text_features_trans / text_features_trans.norm(dim=1, keepdim=True)
-
-            # cosine similarity as logits
-            logit_scale = self.logit_scale.exp()
-            logits_per_image = logit_scale * image_features @ text_features_trans.t()
-        else:
-            # normalized features
-            text_features = text_features / text_features.norm(dim=1, keepdim=True)
-
-            # cosine similarity as logits
-            logit_scale = self.logit_scale.exp()
-            logits_per_image = image_features @ text_features.t()
-
-        ## shape = [global_batch_size, classes]
-        return logits_per_image
-
+        return image_features, classes_prompt_features, caption_features
 
 def convert_weights(model: nn.Module):
     """Convert applicable model parameters to fp16"""

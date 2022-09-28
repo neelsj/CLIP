@@ -30,5 +30,4 @@ jobs:
   sla_tier: Basic
   command:
   - python src/main.py /mnt/objectnet/data/ILSVRC2012 --lr 1e-2 --mode context --b 1024
-
   

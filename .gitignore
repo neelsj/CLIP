@@ -14,3 +14,4 @@ thumbs.db
 /src/clip/.vs
 /amlt_docker_images.txt
 /log.txt
+*.bak
