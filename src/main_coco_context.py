@@ -44,7 +44,16 @@ class CocoDetectionCaption(datasets.VisionDataset):
 
         self.coco = COCO(annFile)
         self.cocoCap = COCO(annCapFile)
-        self.ids = list(sorted(self.coco.imgs.keys()))
+        self.ids = [] 
+        
+        ids_all = list(sorted(self.coco.imgs.keys()))
+
+        for id in ids_all:
+            anns = self.coco.loadAnns(self.coco.getAnnIds(id))
+            if (anns):
+                self.ids.append(id)
+
+        print("%d ids, %d ids with objects" % (len(ids_all), len(self.ids)))
 
         self.coco_id_to_ind = {}
         for i, cat in enumerate(self.coco.cats):
@@ -63,8 +72,14 @@ class CocoDetectionCaption(datasets.VisionDataset):
         random.shuffle(categories)
 
         categories_text = [self.coco.cats[category_id]["name"] for category_id in categories]
+
+        captions = [ann["caption"] for ann in annsCap]
+        caption = random.choice(captions)
         
+        #print(anns)
+        #print(categories)
         #print(categories_text)
+        #print(captions)
 
         classes_prompt = f"A photo of a %s" % categories_text[0]
         
@@ -72,10 +87,6 @@ class CocoDetectionCaption(datasets.VisionDataset):
             classes_prompt = classes_prompt + "".join([f", {c}" for c in categories_text[1:-1]])
 
         classes_prompt = classes_prompt + f", and a %s." % categories_text[-1]
-
-        captions = [ann["caption"] for ann in annsCap]
-
-        caption = random.choice(captions)
 
         #print(classes_prompt)
         #print(caption)
@@ -377,40 +388,32 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
+
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
+        [batch_time, data_time, losses],
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
     model.train()
 
     end = time.time()
-    for i, (images, target) in enumerate(train_loader):
+    for i, (images, classes_prompt_tokens, caption_tokens) in enumerate(train_loader):               
         # measure data loading time
         data_time.update(time.time() - end)
 
         if torch.cuda.is_available():
             images = images.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
-
-        #print(target.min().data.cpu(), target.max().data.cpu()) 
+            classes_prompt_tokens = classes_prompt_tokens.cuda(args.gpu, non_blocking=True)
+            caption_tokens = caption_tokens.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        output = model(images, text_tokens)
+        image_features, classes_prompt_features, image_classes_prompt_features_trans, caption_features = model(images, classes_prompt_tokens, caption_tokens)
 
-        print(output)
-        print(target)
+        loss = torch.mean(1-criterion(image_classes_prompt_features_trans, caption_features))
 
-        loss = criterion(output, target)
-
-        # measure accuracy_multilabel and record loss
-        acc1, acc5 = accuracy_multilabel(output, target, threshs=(.2, .5))
+        # measure accuracy_multilabel and record loss        
         losses.update(loss.item(), images.size(0))
-        top1.update(acc1, images.size(0))
-        top5.update(acc5, images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -430,9 +433,10 @@ def validate(val_loader, model, criterion, args):
     losses1 = AverageMeter('Loss 1', ':.4e', Summary.NONE)
     losses2 = AverageMeter('Loss 2', ':.4e', Summary.NONE)
     losses3 = AverageMeter('Loss 3', ':.4e', Summary.NONE)
+    losses4 = AverageMeter('Loss 4', ':.4e', Summary.NONE)
     progress = ProgressMeter(
         len(val_loader),
-        [batch_time, losses1, losses2, losses3],
+        [batch_time, losses1, losses2, losses3, losses4],
         prefix='Test: ')
 
     # switch to evaluate mode
@@ -451,16 +455,19 @@ def validate(val_loader, model, criterion, args):
                 caption_tokens = caption_tokens.cuda(args.gpu, non_blocking=True)
 
             # compute output
-            image_features, classes_prompt_features, caption_features = model(images, classes_prompt_tokens, caption_tokens)
+            image_features, classes_prompt_features, image_classes_prompt_features_trans, caption_features = model(images, classes_prompt_tokens, caption_tokens)
 
-            loss1 = 1-criterion(image_features, classes_prompt_features)
-            loss2 = 1-criterion(classes_prompt_features, caption_features)
-            loss3 = 1-criterion(image_features, caption_features)
+            loss1 = torch.mean(1-criterion(image_features, classes_prompt_features))
+            loss2 = torch.mean(1-criterion(classes_prompt_features, caption_features))
+            loss3 = torch.mean(1-criterion(image_features, caption_features))
+
+            loss4 = torch.mean(1-criterion(image_classes_prompt_features_trans, caption_features))
 
             # measure accuracy_multilabel and record loss
             losses1.update(loss1.item(), images.size(0))
             losses2.update(loss2.item(), images.size(0))
             losses3.update(loss3.item(), images.size(0))
+            losses4.update(loss4.item(), images.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -471,7 +478,7 @@ def validate(val_loader, model, criterion, args):
 
     progress.display_summary()
 
-    return top1.avg
+    return losses4.avg
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
 

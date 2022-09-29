@@ -371,19 +371,24 @@ class CLIP(nn.Module):
         classes_prompt_features = self.encode_text(classes_prompt_tokens)
         caption_features = self.encode_text(caption_tokens)
 
-        image_features = image_features / image_features.norm(dim=1, keepdim=True)
-        classes_prompt_features = classes_prompt_features / classes_prompt_features.norm(dim=1, keepdim=True)
+        #image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        #classes_prompt_features = classes_prompt_features / classes_prompt_features.norm(dim=1, keepdim=True)
+
         caption_features = caption_features / caption_features.norm(dim=1, keepdim=True)
 
         #print(image_features.shape)
         #print(classes_prompt_features.shape)
         #print(caption_features.shape)
 
-        #image_text_features = torch.cat((image_features, text_features),-1)        
-        #image_text_features_trans = self.image_text(image_text_features)        
-        #image_text_features_trans = image_text_features_trans / image_text_features_trans.norm(dim=1, keepdim=True)            
+        image_classes_prompt_features = torch.cat((image_features, classes_prompt_features),-1)        
+        image_classes_prompt_features_trans = self.image_text(image_classes_prompt_features)   
+        
+        image_classes_prompt_features_trans = image_classes_prompt_features_trans / image_classes_prompt_features_trans.norm(dim=1, keepdim=True)            
 
-        return image_features, classes_prompt_features, caption_features
+        image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        classes_prompt_features = classes_prompt_features / classes_prompt_features.norm(dim=1, keepdim=True)
+
+        return image_features, classes_prompt_features, image_classes_prompt_features_trans, caption_features
 
 def convert_weights(model: nn.Module):
     """Convert applicable model parameters to fp16"""
